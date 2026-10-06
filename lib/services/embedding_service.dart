@@ -1,118 +1,80 @@
-import 'dart:typed_data';
-import 'dart:io';
-import 'package:tflite_flutter/tflite_flutter.dart';
+import 'dart:convert';
+import 'package:http/http.dart' as http;
 
 class EmbeddingService {
   static EmbeddingService? instance;
-  Interpreter? _interpreter;
-  final int maxSeqLength = 256;
+  final String apiKey;
   final int embeddingDim = 384;
 
-  static Future<void> init(String modelPath) async {
-    instance = EmbeddingService();
-    await instance!._initializeFromFile(modelPath);
+  EmbeddingService._(this.apiKey);
+
+  static Future<void> init(String? modelPath, {String? apiKey}) async {
+    if (apiKey == null || apiKey.isEmpty) {
+      throw Exception("Gemini API key is required for embeddings");
+    }
+    instance = EmbeddingService._(apiKey);
+    print('Gemini Embedding API initialized.');
   }
 
-  Future<void> _initializeFromFile(String path) async {
-    try {
-      _interpreter = await Interpreter.fromFile(File(path));
-      print('TFLite model loaded successfully from file.');
-    } catch (e) {
-      print('Error loading TFLite model from file: $e');
-    }
+  /// Generates a 384-dimensional vector for a given text chunk using Gemini
+  Future<List<double>> generateEmbedding(String text) async {
+    final embeddings = await generateEmbeddings([text]);
+    return embeddings.first;
   }
 
+  /// Generates 384-dimensional vectors for a list of text chunks using Gemini
+  Future<List<List<double>>> generateEmbeddings(List<String> texts) async {
+    if (texts.isEmpty) return [];
 
-  /// Generates a 384-dimensional vector for a given text chunk
-  List<double> generateEmbedding(String text) {
-    if (_interpreter == null) {
-      throw Exception("Interpreter not initialized");
-    }
-
-    // 1. Tokenization (Placeholder)
-    // NOTE: all-MiniLM-L6-v2 requires a WordPiece tokenizer and a vocab.txt file.
-    // For this offline RAG POC, we simulate the tokenization output. 
-    // You would replace this with a real WordPiece Dart implementation.
-    List<int> inputIds = _mockWordPieceTokenizer(text);
-    List<int> attentionMask = List.filled(maxSeqLength, 0);
-    List<int> typeIds = List.filled(maxSeqLength, 0);
-
-    for (int i = 0; i < inputIds.length; i++) {
-      attentionMask[i] = 1;
-    }
-
-    // 2. Prepare Inputs
-    // TFLite expects inputs as lists of lists (tensors)
-    var input0 = [inputIds];
-    var input1 = [attentionMask];
-    var input2 = [typeIds];
-
-    // Assuming the model takes input_ids, attention_mask, token_type_ids
-    // The exact order depends on how the .tflite model was exported.
-    Map<int, Object> inputs = {
-      0: input0,
-      1: input1,
-      2: input2,
-    };
-
-    // 3. Prepare Output Tensor
-    // Output shape for MiniLM before pooling is usually [1, seqLength, 384]
-    var output = List.generate(
-        1, 
-        (i) => List.generate(maxSeqLength, (j) => List.filled(embeddingDim, 0.0))
-    );
-
-    Map<int, Object> outputs = {
-      0: output,
-    };
-
-    // 4. Run Inference on-device
-    _interpreter!.runForMultipleInputs(inputs.values.toList(), outputs);
-
-    // 5. Mean Pooling
-    // The model outputs embeddings for every token. We mean-pool them to get 
-    // a single 384-dimensional vector representing the entire sentence/chunk.
-    return _meanPooling(output[0], attentionMask);
-  }
-
-  List<int> _mockWordPieceTokenizer(String text) {
-    // A dummy tokenizer. In production, load vocab.txt and use a WordPiece algorithm.
-    // We truncate to maxSeqLength - 2 to leave room for [CLS] and [SEP] tokens.
-    final words = text.split(' ').take(maxSeqLength - 2).toList();
-    List<int> tokens = List.filled(maxSeqLength, 0); // 0 is usually [PAD]
+    final url = Uri.parse(
+        'https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:batchEmbedContents?key=$apiKey');
     
-    tokens[0] = 101; // [CLS] token id in BERT
-    for (int i = 0; i < words.length; i++) {
-      tokens[i + 1] = words[i].hashCode % 30000; // Mock ID mapped to vocab size
-    }
-    tokens[words.length + 1] = 102; // [SEP] token id
-    
-    return tokens;
-  }
+    final requests = texts.map((text) => {
+      "model": "models/gemini-embedding-2",
+      "content": {
+        "parts": [
+          {"text": text}
+        ]
+      },
+      "outputDimensionality": embeddingDim
+    }).toList();
 
-  List<double> _meanPooling(List<List<double>> tokenEmbeddings, List<int> attentionMask) {
-    List<double> sentenceEmbedding = List.filled(embeddingDim, 0.0);
-    int validTokens = 0;
+    int maxRetries = 10;
+    int retryCount = 0;
+    int delayMs = 15000; // Start with a 15-second wait on 429
 
-    for (int i = 0; i < maxSeqLength; i++) {
-      if (attentionMask[i] == 1) {
-        validTokens++;
-        for (int j = 0; j < embeddingDim; j++) {
-          sentenceEmbedding[j] += tokenEmbeddings[i][j];
+    while (retryCount < maxRetries) {
+      final response = await http.post(
+        url,
+        headers: {'Content-Type': 'application/json'},
+        body: json.encode({
+          "requests": requests
+        }),
+      );
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        final List<dynamic> embeddingsData = data['embeddings'];
+        return embeddingsData.map((e) {
+          final List<dynamic> values = e['values'];
+          return values.cast<double>();
+        }).toList();
+      } else if (response.statusCode == 429) {
+        retryCount++;
+        print('Rate limit hit (429). Waiting ${delayMs / 1000} seconds before retry $retryCount...');
+        if (retryCount >= maxRetries) {
+          throw Exception('Rate limit exceeded after heavy retries: ${response.body}');
         }
+        await Future.delayed(Duration(milliseconds: delayMs));
+        delayMs += 15000; // Increase wait by 15s each time (15s, 30s, 45s...)
+      } else {
+        throw Exception('Failed to generate embeddings: ${response.statusCode} - ${response.body}');
       }
     }
-
-    if (validTokens > 0) {
-      for (int j = 0; j < embeddingDim; j++) {
-        sentenceEmbedding[j] /= validTokens;
-      }
-    }
-
-    return sentenceEmbedding;
+    throw Exception('Failed to generate embeddings');
   }
 
   void dispose() {
-    _interpreter?.close();
+    // No local resources to dispose
   }
 }

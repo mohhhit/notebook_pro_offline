@@ -1,0 +1,131 @@
+  Stream<ChatStreamEvent> sendMessageStream({
+    required String query,
+    required String spaceId,
+    String? chatId,
+    String workflow = 'chat',
+  }) async* {
+    yield ChatStreamEvent(
+      event: 'message',
+      data: {'content': '\n\n**?? Searching Documents...**\n'},
+    );
+
+    // Get API Keys
+    final config = await getConfig();
+    final geminiKey = config['gemini_api_key'];
+    final groqKey = config['groq_api_key'];
+
+    if (geminiKey == null || geminiKey.isEmpty) {
+      yield ChatStreamEvent(
+        event: 'message',
+        data: {'content': 'Error: Gemini API key is missing. Please add it in settings.', 'isComplete': true},
+      );
+      return;
+    }
+
+    // 1. Generate query embedding using Gemini
+    final embedding = await EmbeddingService.instance!.generateEmbedding(query);
+
+    // 2. Search ObjectBox
+    final chunks = ObjectBoxService.instance!.searchChunks(embedding, limit: 3);
+    
+    String contextText = chunks.map((c) => c.text).join('\n\n---\n\n');
+    String prompt = '''You are a helpful assistant answering questions based on the provided context.
+If the answer is not in the context, say so.
+Context:
+$contextText
+
+Question: $query
+Answer:''';
+
+    yield ChatStreamEvent(
+      event: 'message',
+      data: {'content': '?? Generating answer...\n\n'},
+    );
+
+    // 3. Call Gemini to stream the answer
+    final geminiUrl = Uri.parse(
+        'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?key=$geminiKey');
+    
+    final request = http.Request('POST', geminiUrl)
+      ..headers.addAll({'Content-Type': 'application/json'})
+      ..body = json.encode({
+        "contents": [{"parts": [{"text": prompt}]}]
+      });
+
+    final response = await http.Client().send(request);
+    
+    if (response.statusCode != 200) {
+      final errorBytes = await response.stream.toBytes();
+      final errorText = utf8.decode(errorBytes);
+      yield ChatStreamEvent(
+        event: 'message',
+        data: {'content': 'Error from Gemini: $errorText', 'isComplete': true},
+      );
+      return;
+    }
+
+    StringBuffer fullAnswer = StringBuffer();
+    
+    await for (final chunk in response.stream.transform(utf8.decoder)) {
+      final matches = RegExp(r'"text":\s*"([^"\\]*(?:\\.[^"\\]*)*)"').allMatches(chunk);
+      for (final match in matches) {
+        if (match.groupCount >= 1) {
+          String textChunk = match.group(1)!;
+          textChunk = textChunk.replaceAll(r'\n', '\n').replaceAll(r'\"', '"').replaceAll(r'\\', '\\');
+          fullAnswer.write(textChunk);
+          yield ChatStreamEvent(
+            event: 'message',
+            data: {'content': textChunk},
+          );
+        }
+      }
+    }
+    
+    yield ChatStreamEvent(
+      event: 'message',
+      data: {'content': '', 'isComplete': true},
+    );
+
+    // 4. Generate Follow-ups using Groq
+    if (groqKey != null && groqKey.isNotEmpty) {
+      try {
+        final groqUrl = Uri.parse('https://api.groq.com/openai/v1/chat/completions');
+        final groqResponse = await http.post(
+          groqUrl,
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer $groqKey'
+          },
+          body: json.encode({
+            "model": "llama3-8b-8192",
+            "messages": [
+              {"role": "system", "content": "Generate exactly 3 short follow-up questions for the user based on their query and the answer. Return them as a JSON array of strings."},
+              {"role": "user", "content": "Query: $query\nAnswer: ${fullAnswer.toString()}"}
+            ],
+            "response_format": {"type": "json_object"}
+          }),
+        );
+
+        if (groqResponse.statusCode == 200) {
+          final data = json.decode(groqResponse.body);
+          final content = json.decode(data['choices'][0]['message']['content']);
+          List<dynamic> questions;
+          if (content is List) {
+            questions = content;
+          } else if (content.containsKey('questions')) {
+            questions = content['questions'];
+          } else {
+            questions = content.values.first;
+          }
+          
+          yield ChatStreamEvent(
+            event: 'followup',
+            data: {'questions': questions.map((q) => q.toString()).toList()},
+          );
+        }
+      } catch (e) {
+        print('Groq follow-up error: $e');
+      }
+    }
+  }
+

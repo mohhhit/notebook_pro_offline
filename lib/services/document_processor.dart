@@ -14,7 +14,8 @@ class ProcessDocumentArgs {
   final String documentName;
   final ByteData storeReference;
   final RootIsolateToken isolateToken;
-  final String modelPath;
+  final String? modelPath;
+  final String? geminiApiKey;
   
   ProcessDocumentArgs({
     required this.filePath,
@@ -22,7 +23,8 @@ class ProcessDocumentArgs {
     required this.documentName,
     required this.storeReference,
     required this.isolateToken,
-    required this.modelPath,
+    this.modelPath,
+    this.geminiApiKey,
   });
 }
 
@@ -43,7 +45,7 @@ class DocumentProcessor {
     final box = store.box<DocumentChunk>();
 
     // 3. Initialize Embedding Service
-    await EmbeddingService.init(args.modelPath);
+    await EmbeddingService.init(args.modelPath, apiKey: args.geminiApiKey);
     final embeddingService = EmbeddingService.instance!;
 
     final file = File(args.filePath);
@@ -65,6 +67,8 @@ class DocumentProcessor {
       int chunkIndex = 0;
       List<DocumentChunk> batchToSave = [];
 
+      List<String> allChunkTexts = [];
+
       for (int i = 0; i < pageCount; i++) {
         final String pageText = extractor.extractText(startPageIndex: i, endPageIndex: i) ?? '';
         
@@ -75,47 +79,45 @@ class DocumentProcessor {
           final chunkWords = currentWordsBuffer.take(wordsPerChunk).toList();
           final chunkText = chunkWords.join(' ');
           
-          // Generate actual embedding using the offline model
-          final embedding = embeddingService.generateEmbedding(chunkText);
-          
-          final chunk = DocumentChunk(
-            documentId: args.documentId,
-            documentName: args.documentName,
-            text: chunkText,
-            chunkIndex: chunkIndex,
-            embedding: embedding, 
-          );
-          
-          batchToSave.add(chunk);
-          chunkIndex++;
-          
+          allChunkTexts.add(chunkText);
           currentWordsBuffer.removeRange(0, wordsPerChunk - wordOverlap);
-
-          if (batchToSave.length >= 20) {
-            box.putMany(batchToSave);
-            batchToSave.clear();
-          }
         }
       }
       
       if (currentWordsBuffer.isNotEmpty) {
         final chunkText = currentWordsBuffer.join(' ');
         if (chunkText.trim().isNotEmpty) {
-          final embedding = embeddingService.generateEmbedding(chunkText);
-          final chunk = DocumentChunk(
-            documentId: args.documentId,
-            documentName: args.documentName,
-            text: chunkText,
-            chunkIndex: chunkIndex,
-            embedding: embedding,
-          );
-          batchToSave.add(chunk);
+          allChunkTexts.add(chunkText);
         }
       }
 
-      if (batchToSave.isNotEmpty) {
+      // Process in batches of 50 for the embedding API to reduce tokens per minute
+      const int batchSize = 50;
+      for (int i = 0; i < allChunkTexts.length; i += batchSize) {
+        final end = (i + batchSize < allChunkTexts.length) ? i + batchSize : allChunkTexts.length;
+        final textsBatch = allChunkTexts.sublist(i, end);
+        
+        // Generate embeddings for the batch
+        final embeddings = await embeddingService.generateEmbeddings(textsBatch);
+        
+        List<DocumentChunk> batchToSave = [];
+        for (int j = 0; j < textsBatch.length; j++) {
+          final chunk = DocumentChunk(
+            documentId: args.documentId,
+            documentName: args.documentName,
+            text: textsBatch[j],
+            chunkIndex: i + j,
+            embedding: embeddings[j],
+          );
+          batchToSave.add(chunk);
+        }
+        
         box.putMany(batchToSave);
-        batchToSave.clear();
+        
+        // Heavy throttle: wait 4 seconds between successful batches to avoid bursting the API
+        if (end < allChunkTexts.length) {
+          await Future.delayed(Duration(seconds: 4));
+        }
       }
 
       return box.query(DocumentChunk_.documentId.equals(args.documentId)).build().count();

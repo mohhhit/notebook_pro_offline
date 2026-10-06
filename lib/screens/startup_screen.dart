@@ -29,41 +29,11 @@ class _StartupScreenState extends State<StartupScreen> {
       setState(() => _statusMessage = 'Initializing Database...');
       await ObjectBoxService.create();
 
-      // 2. Download/Check Embedding Model
-      final appDir = await getApplicationDocumentsDirectory();
-      final modelDir = Directory('${appDir.path}/models');
-      if (!await modelDir.exists()) {
-        await modelDir.create(recursive: true);
-      }
+      // 2. No local embedding model needed. We use Gemini API.
+      setState(() => _statusMessage = 'Initializing...');
+      await Future.delayed(const Duration(milliseconds: 500));
 
-      final embeddingModelFile = File('${modelDir.path}/all-MiniLM-L6-v2.tflite');
-      
-      bool needsDownload = false;
-      if (!await embeddingModelFile.exists()) {
-        needsDownload = true;
-      } else {
-        // If file exists but is too small (e.g. downloaded an HTML error page), delete and re-download
-        final size = await embeddingModelFile.length();
-        if (size < 20000000) {
-          await embeddingModelFile.delete();
-          needsDownload = true;
-        }
-      }
-
-      if (needsDownload) {
-        setState(() {
-          _statusMessage = 'Downloading Embedding Model (22 MB)...';
-          _progress = 0.0;
-        });
-        
-        final url = 'https://huggingface.co/MisterPotato92/all-MiniLM-L6-v2-tflite/resolve/main/sentence_transformer.tflite';
-        await _downloadFile(url, embeddingModelFile);
-      }
-
-      // Initialize the EmbeddingService
-      setState(() => _statusMessage = 'Loading AI Models into Memory...');
-      await EmbeddingService.init(embeddingModelFile.path);
-
+      // Transition to Main App
       // Transition to Main App
       if (mounted) {
         Navigator.of(context).pushReplacement(

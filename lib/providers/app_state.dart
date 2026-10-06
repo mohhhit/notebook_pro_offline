@@ -1237,6 +1237,11 @@ class AppState extends ChangeNotifier with WindowListener {
       final spaceId = _currentSpace!.id;
       final filesJson = prefs.getString('offline_files_$spaceId') ?? '[]';
       List<dynamic> currentFiles = json.decode(filesJson);
+      final geminiApiKey = prefs.getString('gemini_api_key');
+      
+      if (geminiApiKey == null || geminiApiKey.isEmpty) {
+        throw Exception("Please set your Gemini API key in Settings before uploading documents.");
+      }
 
       int chunksProcessed = 0;
 
@@ -1252,6 +1257,7 @@ class AppState extends ChangeNotifier with WindowListener {
           storeReference: storeRef,
           isolateToken: token,
           modelPath: modelPath,
+          geminiApiKey: geminiApiKey,
         );
         
         final chunks = await DocumentProcessor.processDocument(args);

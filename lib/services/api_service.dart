@@ -202,38 +202,128 @@ class ApiService {
   }) async* {
     yield ChatStreamEvent(
       event: 'message',
-      data: {'content': '\n\n**âš™ï¸  Offline RAG Search...**\n'},
+      data: {'content': '\n\n**?? Searching Documents...**\n'},
     );
 
-    // 1. Generate query embedding
-    final embedding = EmbeddingService.instance!.generateEmbedding(query);
+    // Get API Keys
+    final config = await getConfig();
+    final geminiKey = config['gemini_api_key'];
+    final groqKey = config['groq_api_key'];
+
+    if (geminiKey == null || geminiKey.isEmpty) {
+      yield ChatStreamEvent(
+        event: 'message',
+        data: {'content': 'Error: Gemini API key is missing. Please add it in settings.', 'isComplete': true},
+      );
+      return;
+    }
+
+    // 1. Generate query embedding using Gemini
+    await EmbeddingService.init(null, apiKey: geminiKey);
+    final embedding = await EmbeddingService.instance!.generateEmbedding(query);
 
     // 2. Search ObjectBox
     final chunks = ObjectBoxService.instance!.searchChunks(embedding, limit: 3);
+    
+    String contextText = chunks.map((c) => c.text).join('\n\n---\n\n');
+    String prompt = '''You are a helpful assistant answering questions based on the provided context.
+If the answer is not in the context, say so.
+Context:
+$contextText
+
+Question: $query
+Answer:''';
 
     yield ChatStreamEvent(
       event: 'message',
-      data: {'content': '\nFound ${chunks.length} chunks.\n\n'},
+      data: {'content': '?? Generating answer...\n\n'},
     );
 
-    await Future.delayed(const Duration(milliseconds: 500));
+    // 3. Call Gemini to stream the answer
+    final geminiUrl = Uri.parse(
+        'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?key=$geminiKey');
+    
+    final request = http.Request('POST', geminiUrl)
+      ..headers.addAll({'Content-Type': 'application/json'})
+      ..body = json.encode({
+        "contents": [{"parts": [{"text": prompt}]}]
+      });
 
-    // 3. Return Raw Chunks as answer for POC
-    String answer = '';
-    for (int i = 0; i < chunks.length; i++) {
-      answer += '> **Chunk ${i + 1}:**\n> ${chunks[i].text.replaceAll('\n', ' ')}\n\n';
+    final response = await http.Client().send(request);
+    
+    if (response.statusCode != 200) {
+      final errorBytes = await response.stream.toBytes();
+      final errorText = utf8.decode(errorBytes);
+      yield ChatStreamEvent(
+        event: 'message',
+        data: {'content': 'Error from Gemini: $errorText', 'isComplete': true},
+      );
+      return;
     }
 
-    if (chunks.isEmpty) {
-      answer = 'No relevant documents found in this local Space.';
-    } else {
-      answer += '---\n*Note: This is the raw retrieved context. A local LLM (like Llama.cpp) would use this text to answer your question!*';
+    StringBuffer fullAnswer = StringBuffer();
+    
+    await for (final chunk in response.stream.transform(utf8.decoder)) {
+      final matches = RegExp(r'"text":\s*"([^"\\]*(?:\\.[^"\\]*)*)"').allMatches(chunk);
+      for (final match in matches) {
+        if (match.groupCount >= 1) {
+          String textChunk = match.group(1)!;
+          textChunk = textChunk.replaceAll(r'\n', '\n').replaceAll(r'\"', '"').replaceAll(r'\\', '\\');
+          fullAnswer.write(textChunk);
+          yield ChatStreamEvent(
+            event: 'message',
+            data: {'content': textChunk},
+          );
+        }
+      }
     }
-
+    
     yield ChatStreamEvent(
       event: 'message',
-      data: {'content': answer, 'isComplete': true},
+      data: {'content': '', 'isComplete': true},
     );
+
+    // 4. Generate Follow-ups using Groq
+    if (groqKey != null && groqKey.isNotEmpty) {
+      try {
+        final groqUrl = Uri.parse('https://api.groq.com/openai/v1/chat/completions');
+        final groqResponse = await http.post(
+          groqUrl,
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer $groqKey'
+          },
+          body: json.encode({
+            "model": "llama3-8b-8192",
+            "messages": [
+              {"role": "system", "content": "Generate exactly 3 short follow-up questions for the user based on their query and the answer. Return them as a JSON array of strings."},
+              {"role": "user", "content": "Query: $query\nAnswer: ${fullAnswer.toString()}"}
+            ],
+            "response_format": {"type": "json_object"}
+          }),
+        );
+
+        if (groqResponse.statusCode == 200) {
+          final data = json.decode(groqResponse.body);
+          final content = json.decode(data['choices'][0]['message']['content']);
+          List<dynamic> questions;
+          if (content is List) {
+            questions = content;
+          } else if (content.containsKey('questions')) {
+            questions = content['questions'];
+          } else {
+            questions = content.values.first;
+          }
+          
+          yield ChatStreamEvent(
+            event: 'followup',
+            data: {'questions': questions.map((q) => q.toString()).toList()},
+          );
+        }
+      } catch (e) {
+        print('Groq follow-up error: $e');
+      }
+    }
   }
 
   // ==================== File Upload ====================
@@ -318,10 +408,11 @@ class ApiService {
   // ==================== Config ====================
 
   Future<Map<String, String?>> getConfig() async {
+    final prefs = await SharedPreferences.getInstance();
     return {
-      'groq_api_key': null,
-      'gemini_api_key': null,
-      'nvidia_api_key': null,
+      'groq_api_key': prefs.getString('groq_api_key'),
+      'gemini_api_key': prefs.getString('gemini_api_key'),
+      'nvidia_api_key': prefs.getString('nvidia_api_key'),
     };
   }
 
@@ -330,6 +421,10 @@ class ApiService {
     String? geminiKey,
     String? nvidiaKey,
   }) async {
+    final prefs = await SharedPreferences.getInstance();
+    if (groqKey != null) await prefs.setString('groq_api_key', groqKey);
+    if (geminiKey != null) await prefs.setString('gemini_api_key', geminiKey);
+    if (nvidiaKey != null) await prefs.setString('nvidia_api_key', nvidiaKey);
   }
 }
 
